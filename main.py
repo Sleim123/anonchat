@@ -29,18 +29,15 @@ logger = logging.getLogger(__name__)
 
 class AnonymousChatBot:
     def __init__(self):
-        # Инициализация компонентов
         self.db = DatabaseManager()
         self.cache = RedisCache()
         self.message_queue = MessageQueue()
         
-        # Инициализация сервисов
         self.user_service = UserService(self.db, self.cache)
         self.chat_service = ChatService(self.db, self.cache)
         self.message_service = MessageService(self.message_queue)
         self.matching_service = MatchingService(self.db)
         
-        # Инициализация обработчиков
         self.command_handler = CommandHandler(
             self.user_service,
             self.chat_service,
@@ -54,18 +51,19 @@ class AnonymousChatBot:
         
         self.application = None
         self.is_running = False
-        self._stop_event = asyncio.Event()
+        self._queue_task = None
+        self._shutdown_event = asyncio.Event()
 
     async def setup_handlers(self):
-        """Настройка обработчиков команд и сообщений"""
-        # Обработчики команд (высший приоритет)
+        if not self.application:
+            return
+
         self.application.add_handler(TelegramCommandHandler("start", self.command_handler.start), group=1)
         self.application.add_handler(TelegramCommandHandler("search", self.command_handler.search), group=1)
         self.application.add_handler(TelegramCommandHandler("stop", self.command_handler.stop), group=1)
         self.application.add_handler(TelegramCommandHandler("next", self.command_handler.next), group=1)
         self.application.add_handler(TelegramCommandHandler("profile", self.command_handler.profile), group=1)
 
-        # Обработчики сообщений (средний приоритет)
         self.application.add_handler(
             TelegramMessageHandler(
                 filters.TEXT & ~filters.COMMAND,
@@ -74,7 +72,6 @@ class AnonymousChatBot:
             group=2
         )
 
-        # Обработчики медиа (низкий приоритет)
         media_filters = (
             filters.PHOTO |
             filters.VIDEO |
@@ -91,7 +88,6 @@ class AnonymousChatBot:
             group=3
         )
 
-        # Обработчик callback-запросов от inline-клавиатуры
         self.application.add_handler(
             CallbackQueryHandler(self.message_handler.handle_callback),
             group=4
@@ -99,14 +95,19 @@ class AnonymousChatBot:
 
     async def initialize(self):
         """Инициализация компонентов бота"""
-        await self.db.connect()
-        logger.info("Database connection established")
-        
-        await self.cache.connect()
-        logger.info("Redis connection established")
-        
-        await self.message_queue.__aenter__()
-        logger.info("Message queue processor started")
+        try:
+            await self.db.connect()
+            logger.info("Database connection established")
+            
+            await self.cache.connect()
+            logger.info("Redis connection established")
+            
+            self._queue_task = asyncio.create_task(self.message_queue.start_processing())
+            logger.info("Message queue processor started")
+        except Exception as e:
+            logger.error(f"Error during initialization: {e}")
+            await self.shutdown()
+            raise
 
     async def shutdown(self):
         """Корректное завершение работы бота"""
@@ -114,35 +115,37 @@ class AnonymousChatBot:
             return
 
         self.is_running = False
-        self._stop_event.set()
+        self._shutdown_event.set()
 
-        if self.application:
+        # Останавливаем очередь сообщений
+        if self._queue_task and not self._queue_task.done():
+            self.message_queue.processing = False
             try:
-                await self.application.stop()
-                await self.application.shutdown()
-                logger.info("Application stopped successfully")
-            except Exception as e:
-                logger.error(f"Error stopping application: {e}")
+                self._queue_task.cancel()
+                await asyncio.shield(self._queue_task)
+            except asyncio.CancelledError:
+                pass
 
-        try:
-            await self.message_queue.__aexit__(None, None, None)
-            logger.info("Message queue stopped successfully")
-        except Exception as e:
-            logger.error(f"Error stopping message queue: {e}")
+        # Останавливаем компоненты в правильном порядке
+        components = [
+            (self.application, "Application"),
+            (self.message_queue, "Message queue"),
+            (self.cache, "Redis"),
+            (self.db, "Database")
+        ]
 
-        try:
-            await self.cache.close()
-            logger.info("Redis connection closed successfully")
-        except Exception as e:
-            logger.error(f"Error closing Redis: {e}")
+        for component, name in components:
+            if component:
+                try:
+                    if hasattr(component, 'stop'):
+                        await component.stop()
+                    elif hasattr(component, 'close'):
+                        await component.close()
+                    logger.info(f"{name} stopped successfully")
+                except Exception as e:
+                    logger.error(f"Error stopping {name}: {e}")
 
-        try:
-            await self.db.close()
-            logger.info("Database connection closed successfully")
-        except Exception as e:
-            logger.error(f"Error closing database: {e}")
-
-    async def start(self):
+    async def run(self):
         """Запуск бота"""
         try:
             # Создаем приложение
@@ -162,48 +165,43 @@ class AnonymousChatBot:
             await self.application.initialize()
             await self.application.start()
             
-            # Запускаем polling в отдельной задаче
-            polling_task = asyncio.create_task(
-                self.application.run_polling(
-                    allowed_updates=Update.ALL_TYPES,
-                    drop_pending_updates=True,
-                    stop_signals=()  # Отключаем встроенную обработку сигналов
-                )
-            )
-
-            # Ждем сигнала остановки
-            await self._stop_event.wait()
-            
-            # Отменяем задачу polling
-            polling_task.cancel()
-            try:
-                await polling_task
-            except asyncio.CancelledError:
-                pass
+            # Запускаем polling в бесконечном цикле
+            while not self._shutdown_event.is_set():
+                try:
+                    await self.application.updater.start_polling()
+                    await self._shutdown_event.wait()
+                except Exception as e:
+                    logger.error(f"Polling error: {e}")
+                    if not self._shutdown_event.is_set():
+                        await asyncio.sleep(1)
+                    else:
+                        break
 
         except Exception as e:
-            logger.error(f"Error starting bot: {e}")
+            logger.error(f"Error running bot: {e}")
             raise
         finally:
             await self.shutdown()
 
 def main():
+    """Главная функция запуска бота"""
     bot = AnonymousChatBot()
     
     def signal_handler(signum, frame):
         """Обработчик сигналов"""
         if bot.is_running:
             logger.info(f"Received signal {signum}")
-            # Устанавливаем событие остановки
-            asyncio.get_event_loop().call_soon_threadsafe(bot._stop_event.set)
+            # Используем правильный способ установки события в event loop
+            loop = asyncio.get_running_loop()
+            loop.call_soon_threadsafe(bot._shutdown_event.set)
 
     # Регистрируем обработчики сигналов
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
     try:
-        # Запускаем бота
-        asyncio.run(bot.start())
+        # Запускаем бота в отдельном event loop
+        asyncio.run(bot.run())
     except KeyboardInterrupt:
         logger.info("Bot stopped by user")
     except Exception as e:
