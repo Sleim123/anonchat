@@ -47,8 +47,7 @@ class MessageHandler:
             "🔎 Поиск собеседника": self._handle_search,
             "❌ Остановить поиск": self._handle_stop_search,
             "🎭 Поиск по полу": self._handle_gender_search,
-            "📙 Интересы": self._handle_
-            ,
+            "📙 Интересы": self._handle_interests,  # Исправлено
             "💼 Профиль": self._handle_profile,
             "👨‍🦰 Поиск М": lambda u, c, user: self._handle_gender_specific_search(u, c, user, "m"),
             "👩‍🦱 Поиск Д": lambda u, c, user: self._handle_gender_specific_search(u, c, user, "w"),
@@ -120,7 +119,11 @@ class MessageHandler:
 
     async def _handle_stop_search(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user):
         """Обработка команды остановки поиска"""
-        if user.status != "searching":
+        if user.status == "chatting":
+            # Если пользователь в чате, используем стандартную команду stop
+            await context.application.bot_data["command_handler"].stop(update, context)
+            return
+        elif user.status != "searching":
             await update.message.reply_text(
                 "_Вы не в поиске собеседника_",
                 parse_mode='Markdown',
@@ -128,6 +131,7 @@ class MessageHandler:
             )
             return
 
+        # Останавливаем поиск
         user.status = "normal"
         await self.user_service.update_user(user)
 
@@ -284,3 +288,31 @@ class MessageHandler:
             await query.answer("👎 Вы поставили дизлайк")
         else:
             await query.answer("Пользователь не найден")
+
+    async def _handle_search(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user):
+        """Обработчик кнопки поиска собеседника"""
+        await context.application.bot_data["command_handler"].search(update, context)
+
+    async def _handle_stop_search(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user):
+        """Обработчик кнопки остановки поиска"""
+        await context.application.bot_data["command_handler"].stop(update, context)
+
+    async def _handle_gender_search(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user):
+        """Обработчик кнопки поиска по полу"""
+        await update.message.reply_text(
+            "*👥 Выберите пол собеседника:*",
+            parse_mode='Markdown',
+            reply_markup=self.keyboards.get_gender_search_keyboard()
+        )
+
+    async def _handle_interests(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user):
+        """Обработчик кнопки интересов"""
+        await update.message.reply_text(
+            "*📙 Выберите ваши интересы:*\n\n_Максимум 5 интересов_",
+            parse_mode='Markdown',
+            reply_markup=self.keyboards.get_interests_keyboard(user.interests)
+        )
+
+    async def _handle_profile(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user):
+        """Обработчик кнопки профиля"""
+        await context.application.bot_data["command_handler"].profile(update, context)

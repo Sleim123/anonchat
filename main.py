@@ -16,6 +16,7 @@ from core.redis_cache import RedisCache
 from core.queue_manager import MessageQueue
 from handlers.command_handlers import CommandHandler
 from handlers.message_handlers import MessageHandler as CustomMessageHandler
+from handlers.callback_handlers import CallbackHandler
 from services.user_service import UserService
 from services.chat_service import ChatService
 from services.message_service import MessageService
@@ -48,6 +49,7 @@ class AnonymousChatBot:
             self.chat_service,
             self.message_service
         )
+        self.callback_handler = CallbackHandler(self.user_service)
         
         self.application = None
         self.is_running = False
@@ -89,21 +91,40 @@ class AnonymousChatBot:
         )
 
         self.application.add_handler(
-            CallbackQueryHandler(self.message_handler.handle_callback),
+            CallbackQueryHandler(self.callback_handler.handle_callback),
             group=4
         )
 
     async def initialize(self):
         """Инициализация компонентов бота"""
         try:
+            # Подключаем базу данных
             await self.db.connect()
             logger.info("Database connection established")
             
+            # Подключаем Redis
             await self.cache.connect()
             logger.info("Redis connection established")
             
+            # Инициализируем обработчик callback-запросов
+            self.callback_handler = CallbackHandler(self.user_service)
+            logger.info("Callback handler initialized")
+            
+            # Сохраняем обработчики в bot_data для доступа из других частей приложения
+            if self.application:
+                self.application.bot_data["command_handler"] = self.command_handler
+                self.application.bot_data["message_handler"] = self.message_handler
+                self.application.bot_data["callback_handler"] = self.callback_handler
+                logger.info("Handlers stored in bot_data")
+                
+            # Запускаем обработку очереди сообщений
             self._queue_task = asyncio.create_task(self.message_queue.start_processing())
             logger.info("Message queue processor started")
+            
+            # Устанавливаем статус "инициализировано"
+            self.is_running = True
+            logger.info("Bot initialization completed successfully")
+            
         except Exception as e:
             logger.error(f"Error during initialization: {e}")
             await self.shutdown()
